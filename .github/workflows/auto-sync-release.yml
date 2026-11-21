@@ -1,0 +1,210 @@
+name: Auto sync upstream and release signed APK
+
+# 定时从 N3urda/hongguoTV 同步 main，使用本仓库专用证书构建四个 release APK 并发布。
+# 触发节奏：上游有新提交即发版；首次运行（尚无 auto Release）自动补发一版。
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force a build even when upstream has no new commits'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-sync-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/N3urda/hongguoTV.git
+  TARGET_REPO: consoleaiden/hongguoTV
+  # 本仓库 release 证书的 SHA-256（公钥指纹，非敏感）。每次构建强制校验签名一致性。
+  RELEASE_CERT_SHA256: c362da1c71a4c6868e34ea3b3d3327b3db9b9453955884e08aa2708d190e9d4c
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ github.token }}
+
+      - name: Sync upstream main
+        id: sync
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo 'Upstream already contained in main.'
+            exit 0
+          fi
+          if ! git merge --no-edit -m "chore: sync upstream main ($(git rev-parse --short upstream/main))" upstream/main; then
+            git merge --abort || true
+            echo '::error::上游代码合并冲突，需要人工处理；本次不发布。'
+            exit 1
+          fi
+          git push origin HEAD:main
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+
+      - name: Decide build
+        id: decide
+        env:
+          CHANGED: ${{ steps.sync.outputs.changed }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          count=$(git tag --list 'kotlin-v*-auto.*' | wc -l)
+          if [[ "$CHANGED" == 'true' || "$FORCE" == 'true' || "$count" -eq 0 ]]; then
+            echo 'build=true' >> "$GITHUB_OUTPUT"
+            echo "Building (changed=$CHANGED force=$FORCE previous_auto_releases=$count)."
+          else
+            echo 'build=false' >> "$GITHUB_OUTPUT"
+            echo 'Upstream unchanged; skipping build.'
+          fi
+
+      - name: Compute version
+        id: version
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          git tag --list 'kotlin-v*-auto.*' > "$RUNNER_TEMP/auto_tags.txt"
+          python3 scripts/auto_release.py version \
+            --gradle kotlin-tv/app/build.gradle.kts \
+            --tags-file "$RUNNER_TEMP/auto_tags.txt" \
+            --output "$GITHUB_OUTPUT"
+
+      - name: Point in-app updater at this fork
+        if: steps.decide.outputs.build == 'true'
+        run: python3 scripts/auto_release.py patch --repo "$TARGET_REPO"
+
+      - name: Self-test release contract
+        if: steps.decide.outputs.build == 'true'
+        run: python3 scripts/auto_release.py self-test
+
+      - name: Set up JDK 17
+        if: steps.decide.outputs.build == 'true'
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        if: steps.decide.outputs.build == 'true'
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          packages: platform-tools
+
+      - name: Install SDK components
+        if: steps.decide.outputs.build == 'true'
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;27.1.12297006'
+
+      - name: Restore signing key from Secrets
+        if: steps.decide.outputs.build == 'true'
+        env:
+          B64: ${{ secrets.HONGGUOTV_KEYSTORE_B64 }}
+          STORE_PASS: ${{ secrets.HONGGUOTV_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.HONGGUOTV_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.HONGGUOTV_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in B64 STORE_PASS KEY_ALIAS KEY_PASS; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::缺少必需的 Secret: $name（配置说明见 docs/SIGNING.md）"
+              exit 1
+            fi
+          done
+          umask 077
+          printf '%s' "$B64" | base64 --decode > "$RUNNER_TEMP/release.p12"
+          test -s "$RUNNER_TEMP/release.p12"
+          if ! keytool -importkeystore -noprompt \
+            -srckeystore "$RUNNER_TEMP/release.p12" -srcstoretype PKCS12 -srcstorepass "$STORE_PASS" \
+            -srcalias "$KEY_ALIAS" -srckeypass "$KEY_PASS" \
+            -destkeystore "$RUNNER_TEMP/release.jks" -deststoretype JKS -deststorepass "$STORE_PASS" \
+            -destalias "$KEY_ALIAS" -destkeypass "$KEY_PASS"; then
+            echo '::error::keystore 转换失败：检查 HONGGUOTV_KEYSTORE_B64 是否为完整 base64、口令与别名是否正确'
+            exit 1
+          fi
+          test -s "$RUNNER_TEMP/release.jks"
+          keytool -list -alias "$KEY_ALIAS" -keystore "$RUNNER_TEMP/release.jks" \
+            -storetype JKS -storepass "$STORE_PASS" >/dev/null
+          echo "Signing alias $KEY_ALIAS verified in release.jks"
+
+      - name: Build four signed release APKs
+        if: steps.decide.outputs.build == 'true'
+        env:
+          HONGGUOTV_KEYSTORE: ${{ runner.temp }}/release.jks
+          HONGGUOTV_STORE_PASSWORD: ${{ secrets.HONGGUOTV_STORE_PASSWORD }}
+          HONGGUOTV_KEY_ALIAS: ${{ secrets.HONGGUOTV_KEY_ALIAS }}
+          HONGGUOTV_KEY_PASSWORD: ${{ secrets.HONGGUOTV_KEY_PASSWORD }}
+          HONGGUOTV_VERSION_NAME: ${{ steps.version.outputs.version_name }}
+          HONGGUOTV_VERSION_CODE: ${{ steps.version.outputs.version_code }}
+        run: bash scripts/build-kotlin.sh
+
+      - name: Verify release certificate on every APK
+        if: steps.decide.outputs.build == 'true'
+        run: python3 scripts/auto_release.py verify-signer --outputs outputs --expected "$RELEASE_CERT_SHA256"
+
+      - name: Generate update.json, SHA256SUMS and release notes
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          python3 scripts/auto_release.py manifest \
+            --outputs outputs \
+            --tag "${{ steps.version.outputs.tag }}" \
+            --version-name "${{ steps.version.outputs.version_name }}" \
+            --version-code "${{ steps.version.outputs.version_code }}" \
+            --commit "$(git rev-parse HEAD)"
+
+      - name: Publish GitHub Release
+        if: steps.decide.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION_NAME: ${{ steps.version.outputs.version_name }}
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse HEAD)
+          if gh api "repos/$TARGET_REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already published; skipping."
+            exit 0
+          fi
+          gh release create "$TAG" --repo "$TARGET_REPO" --target "$commit" \
+            --title "hongguoTV $VERSION_NAME (auto)" \
+            --notes-file outputs/release-notes.md --draft
+          gh release upload "$TAG" --repo "$TARGET_REPO" --clobber \
+            outputs/hongguotv-kotlin-*.apk outputs/update.json outputs/SHA256SUMS
+          gh release edit "$TAG" --repo "$TARGET_REPO" --draft=false --latest=true
+          latest=$(gh api "repos/$TARGET_REPO/releases/latest" --jq .tag_name)
+          if [[ "$latest" != "$TAG" ]]; then
+            echo "::error::发布后 latest 为 $latest，预期 $TAG"
+            exit 1
+          fi
+          echo "Published $TAG"
+
+      - name: Upload release metadata
+        if: always() && steps.decide.outputs.build == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: auto-release-metadata
+          path: |
+            outputs/update.json
+            outputs/SHA256SUMS
+            outputs/release-notes.md
+
+      - name: Remove temporary signing material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.p12" "$RUNNER_TEMP/release.jks"
